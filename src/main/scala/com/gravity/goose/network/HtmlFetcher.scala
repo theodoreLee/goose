@@ -21,15 +21,19 @@ package com.gravity.goose.network
 import org.apache.http.Header
 import org.apache.http.HeaderElement
 import org.apache.http.HttpEntity
+import org.apache.http.HttpHost
+import org.apache.http.HttpResponse
 import org.apache.http.HttpVersion
 import org.apache.http.{HttpRequest, HttpRequestInterceptor, HttpResponse, HttpResponseInterceptor, HeaderElementIterator}
 import org.apache.http.client.entity.GzipDecompressingEntity
 import org.apache.http.client.CookieStore
 import org.apache.http.impl.client.BasicCookieStore
+import org.apache.http.client.entity.GzipDecompressingEntity
 import org.apache.http.client.HttpClient
 import org.apache.http.client.methods.HttpGet
 import org.apache.http.client.params.CookiePolicy
 import org.apache.http.client.protocol.ClientContext
+import org.apache.http.conn.params.ConnRoutePNames
 import org.apache.http.conn.ConnectionKeepAliveStrategy
 import org.apache.http.conn.scheme.PlainSocketFactory
 import org.apache.http.conn.ssl.SSLSocketFactory
@@ -39,20 +43,24 @@ import org.apache.http.impl.conn.PoolingClientConnectionManager
 import org.apache.http.message.BasicHeaderElementIterator
 import org.apache.http.params.{HttpParams, BasicHttpParams, HttpConnectionParams, HttpProtocolParams}
 import org.apache.http.protocol.{HTTP, BasicHttpContext, HttpContext}
-import org.apache.http.util.EntityUtils
 import org.apache.http.entity.ContentType
 import java.io._
 import java.net.SocketException
 import java.net.SocketTimeoutException
+import java.net.URL
 import java.net.URLConnection
 import java.util.ArrayList
-import java.util.Date
 import java.util.List
+import java.util.Date
 import com.gravity.goose.utils.Logging
 import com.gravity.goose.Configuration
 import org.apache.http.impl.client.{DefaultHttpRequestRetryHandler, AbstractHttpClient, DefaultHttpClient}
 import org.apache.commons.io.IOUtils
 import com.ibm.icu.text.CharsetDetector
+import org.apache.http.util.EntityUtils
+import org.apache.http.conn.ClientConnectionManager
+import com.gravity.goose.network.gae.GAEConnectionManager
+import org.apache.http.conn.HttpClientConnectionManager
 
 /**
  * User: Jim Plush
@@ -127,19 +135,34 @@ object HtmlFetcher extends AbstractHtmlFetcher with Logging {
       }
 
       entity = response.getEntity
+      // via http://hc.apache.org/httpcomponents-client-ga/httpclient/examples/org/apache/http/examples/client/ClientGZipContentCompression.java
+      if (entity != null) {
+        try {
+          val ceheader: Header = entity.getContentEncoding();
+          if (ceheader != null) {
+            val codecs: Array[HeaderElement] = ceheader.getElements();
+            for(i <- 0 until codecs.length) {
+              if (codecs(i).getName().equalsIgnoreCase("gzip")) {
+                entity = new GzipDecompressingEntity(response.getEntity())
+              }
+            }
+          }
+        } catch {
+          case e: Exception => {
+            trace("Unable to get header elements: " + cleanUrl)
+          }
+        }
+      }
+
       if (entity != null) {
         instream = entity.getContent
-        var encodingType: String = "UTF-8"
+        val encodingType: String = config.resolveCharSet(url, entity)
 
         try {
           contentType = ContentType.get(entity)
           trace("Got contentType: " + contentType)
-          if (contentType == null) {
-            encodingType = "UTF-8"
-          } else {
-            encodingType = contentType.getCharset().name
-          }
-        }
+
+                    }
         catch {
           case e: Exception => {
             if (logger.isDebugEnabled) {
@@ -179,7 +202,7 @@ object HtmlFetcher extends AbstractHtmlFetcher with Logging {
         throw e
       }
       case e: Exception => {
-        trace("FAILURE FOR LINK: " + cleanUrl + " " + e.toString)
+        warn("FAILURE FOR LINK: " + cleanUrl + " " + e.toString)
         throw e
       }
     }
@@ -236,7 +259,9 @@ object HtmlFetcher extends AbstractHtmlFetcher with Logging {
           trace("GRVBIGFAIL: " + mimeType + " - " + cleanUrl)
           throw new NotHtmlException(cleanUrl)
         }
+
       } 
+
       else {
         trace("no mimetype?: " + mimeType + " - " + cleanUrl)
         throw new NotHtmlException(cleanUrl)
@@ -278,20 +303,16 @@ object HtmlFetcher extends AbstractHtmlFetcher with Logging {
 
       private[network] var emptyList: ArrayList[Cookie] = new ArrayList[Cookie]
     }
-    
+    httpParams.setParameter("http.protocol.single-cookie-header", true)
     httpParams.setParameter("http.protocol.cookie-policy", CookiePolicy.BROWSER_COMPATIBILITY)
     httpParams.setParameter("http.User-Agent", "Mozilla/5.0 (X11; U; Linux x86_64; de; rv:1.9.2.8) Gecko/20100723 Ubuntu/10.04 (lucid) Firefox/3.6.8")
     httpParams.setParameter("http.language.Accept-Language", "en-us")
     httpParams.setParameter("http.protocol.content-charset", "UTF-8")
     httpParams.setParameter("Accept", "application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5")
     httpParams.setParameter("Cache-Control", "max-age=0")
-    httpParams.setParameter("http.connection.stalecheck", false)
-    val schemeRegistry: SchemeRegistry = new SchemeRegistry
-    schemeRegistry.register(new Scheme("http", 80, PlainSocketFactory.getSocketFactory))
-    schemeRegistry.register(new Scheme("https", 443, SSLSocketFactory.getSocketFactory))
-    val cm = new PoolingClientConnectionManager(schemeRegistry)
-    cm.setMaxTotal(4000)
-    cm.setDefaultMaxPerRoute(20)
+    httpParams.setParameter("http.connection.stalecheck", true)
+//gae???
+    val cm = createConnectionManager
 
     httpClient = new DefaultHttpClient(cm, httpParams)
     httpClient.asInstanceOf[AbstractHttpClient].setHttpRequestRetryHandler(new DefaultHttpRequestRetryHandler(0, false))
@@ -299,12 +320,36 @@ object HtmlFetcher extends AbstractHtmlFetcher with Logging {
     httpClient.getParams.setParameter("http.protocol.wait-for-continue", 5000L)  // timeout for how long the client waits for 100-continue before sending request body
     httpClient.getParams.setParameter("http.tcp.nodelay", true)
 
+    // First check proxy configured from java properties, otherwise use env var if set
+    if (scala.sys.props.isDefinedAt("http.proxyHost")) {
+      val host = scala.sys.props.getOrElse("http.proxyHost", "")
+      val port = scala.sys.props.getOrElse("http.proxyPort", "80").toInt
+      httpClient.getParams.setParameter(ConnRoutePNames.DEFAULT_PROXY, new HttpHost(host, port))
+    } else if (sys.env.isDefinedAt("http_proxy")) {
+      val url  = new URL(sys.env.getOrElse("http_proxy", ""))
+      val host = url.getHost
+      val port = url.getPort
+      httpClient.getParams.setParameter(ConnRoutePNames.DEFAULT_PROXY, new HttpHost(host, port))
+    }
+    
     // http://hc.apache.org/httpcomponents-client-ga/httpclient/examples/org/apache/http/examples/client/ClientGZipContentCompression.java
     httpClient.asInstanceOf[AbstractHttpClient].addRequestInterceptor(new HttpRequestInterceptor() {
       def process( request: HttpRequest, context: HttpContext) {
         if (!request.containsHeader("Accept-Encoding")) {
           request.addHeader("Accept-Encoding", "gzip")
         }
+
+    // First check proxy configured from java properties, otherwise use env var if set
+    if (scala.sys.props.isDefinedAt("http.proxyHost")) {
+      val host = scala.sys.props.getOrElse("http.proxyHost", "")
+      val port = scala.sys.props.getOrElse("http.proxyPort", "80").toInt
+      httpClient.getParams.setParameter(ConnRoutePNames.DEFAULT_PROXY, new HttpHost(host, port))
+    } else if (sys.env.isDefinedAt("http_proxy")) {
+      val url  = new URL(sys.env.getOrElse("http_proxy", ""))
+      val host = url.getHost
+      val port = url.getPort
+      httpClient.getParams.setParameter(ConnRoutePNames.DEFAULT_PROXY, new HttpHost(host, port))
+    }
       }
     })
 
@@ -363,7 +408,9 @@ object HtmlFetcher extends AbstractHtmlFetcher with Logging {
     try {
       var buf : Array[Byte] = IOUtils.toByteArray(is)
       return encodedText(buf)
+
     }
+
     catch {
       case e: SocketTimeoutException => {
         logger.warn(e.toString + " " + e.getMessage)
@@ -384,6 +431,24 @@ object HtmlFetcher extends AbstractHtmlFetcher with Logging {
     val matched = detector.detect()
     matched.getLanguage
     matched.getString
+  }
+
+  def createConnectionManager:ClientConnectionManager = createDefaultConnectionManager
+  //enable gae connection manager
+  //def createConnectionManager:ClientConnectionManager = createGaeConnectionManager
+
+  
+  def createGaeConnectionManager = new GAEConnectionManager
+  def createDefaultConnectionManager:ClientConnectionManager = {    
+    val schemeRegistry: SchemeRegistry = new SchemeRegistry
+    schemeRegistry.register(new Scheme("http", 80, PlainSocketFactory.getSocketFactory))
+    schemeRegistry.register(new Scheme("https", 443, SSLSocketFactory.getSocketFactory))
+	//gae??
+	//    val cm = new ThreadSafeClientConnManager(schemeRegistry)
+    val cm = new PoolingClientConnectionManager(schemeRegistry)
+    cm.setMaxTotal(4000)
+    cm.setDefaultMaxPerRoute(20)
+    cm
   }
 }
 

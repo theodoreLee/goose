@@ -24,68 +24,108 @@ package com.gravity.goose.text
  * Date: 8/16/11
  */
 
-import java.util.{ArrayList, List}
-import com.gravity.goose.utils.{Logging, FileHelper}
+import com.gravity.goose.utils.FileHelper
+import com.gravity.goose.Language._
+import com.chenlb.mmseg4j.ComplexSeg
+import com.chenlb.mmseg4j.Dictionary
+import com.chenlb.mmseg4j.MMSeg
+import com.chenlb.mmseg4j.Seg
+import com.chenlb.mmseg4j.Word
+import java.io.StringReader
+import scala.collection.JavaConversions._
+import java.util.HashMap
+import scala.collection.Set
+import java.util.Map
+import com.gravity.goose.Language
 
-import scala.collection.immutable.Map
-
-object StopWords extends Logging{
-
-  import  me.champeau.ld.UberLanguageDetector
-  val detector = UberLanguageDetector.getInstance()
+object StopWords {
 
   // the confusing pattern below is basically just match any non-word character excluding white-space.
   private val PUNCTUATION: StringReplacement = StringReplacement.compile("[^\\p{Ll}\\p{Lu}\\p{Lt}\\p{Lo}\\p{Nd}\\p{Pc}\\s]", string.empty)
-  
-  val STOP_WORDS = Map("ca" -> FileHelper.loadResourceFile("ca.txt", StopWords.getClass).split(sys.props("line.separator")).toSet,
-		  				"de" -> FileHelper.loadResourceFile("de.txt", StopWords.getClass).split(sys.props("line.separator")).toSet,
-		  				"en" -> FileHelper.loadResourceFile("en.txt", StopWords.getClass).split(sys.props("line.separator")).toSet,
-		  				"es" -> FileHelper.loadResourceFile("es.txt", StopWords.getClass).split(sys.props("line.separator")).toSet,
-		  				"fr" -> FileHelper.loadResourceFile("fr.txt", StopWords.getClass).split(sys.props("line.separator")).toSet,
-		  				"it" -> FileHelper.loadResourceFile("it.txt", StopWords.getClass).split(sys.props("line.separator")).toSet,
-		  				"pt" -> FileHelper.loadResourceFile("pt.txt", StopWords.getClass).split(sys.props("line.separator")).toSet,
-		  				"ko" -> FileHelper.loadResourceFile("ko.txt", StopWords.getClass).split(sys.props("line.separator")).toSet,
-		  				"all" -> FileHelper.loadResourceFile("all.txt", StopWords.getClass).split(sys.props("line.separator")).toSet);
+
+//raisercostin: use the other method of memoising the languages on first access
+  // TODO: there must a better way to do this. See
+  // http://www.uofr.net/~greg/java/get-resource-listing.html?
+//  val LANGUAGES: Set[String] = Set("ar", "da", "de", "en", "es", "fi", "fr",
+//                                   "hu", "id", "it", "ko", "nb", "nl", "no",
+//                                   "pl", "pt", "ru", "sv", "zh")
+//
+//  val stopWordsMap: Map[String, Set[String]] =
+//    (LANGUAGES.view map {lang =>
+//      lang ->
+//      FileHelper.loadResourceFile("stopwords-" + lang + ".txt",
+//        StopWords.getClass).split(sys.props("line.separator")).toSet
+//    }).toMap.withDefaultValue(Set())
+
+  //val STOP_WORDS = FileHelper.loadResourceFile("stopwords-en.txt", StopWords.getClass).split(sys.props("line.separator")).toSet
+  private var stopWordsMap: Map[String, Set[String]] = new HashMap[String, Set[String]]()
 
   def removePunctuation(str: String): String = {
     PUNCTUATION.replaceAll(str)
   }
+  
+  def getStopWords(language: Language): Set[String] = getStopWords(language.toString)
 
-  def getStopWordCount(content: String): WordStats = {
+  def getStopWords(lname: String): Set[String] = {
+
+    var stopWords = stopWordsMap.get(lname)
+    if (stopWords == null) {
+      var stopWordsFile = "stopwords-%s.txt" format lname
+      stopWords = FileHelper.loadResourceFile(stopWordsFile, StopWords.getClass).split(sys.props("line.separator")).toSet
+      stopWords = stopWords.map(s=>s.trim)
+      stopWordsMap.put(lname, stopWords)
+    }
+    stopWords    
+  }
+  def getCandidateWords(strippedInput: String, language: String): Array[String] = getCandidateWords(strippedInput, 
+      Language(language))
+
+  def getCandidateWords(strippedInput: String, language: Language): Array[String] = {
+	language match {
+	  case English => string.SPACE_SPLITTER.split(strippedInput)
+	  case Chinese => tokenize(strippedInput).toArray
+	  case _ => string.SPACE_SPLITTER.split(strippedInput)
+	}
+  } 
+
+  def getStopWordCount(content: String, lang: String = "en"): WordStats = {
+//  def getStopWordCount(content: String, language: Language): WordStats = {
+
     if (string.isNullOrEmpty(content)) return WordStats.EMPTY
     val ws: WordStats = new WordStats
     val strippedInput: String = removePunctuation(content)
 
-    val candidateWords: Array[String] = string.SPACE_SPLITTER.split(strippedInput)
+    //val candidateWords = getCandidateWords(strippedInput, language)
+    val candidateWords = getCandidateWords(strippedInput, lang)
+      
+    var overlappingStopWords: List[String] = List[String]()
 
-    val overlappingStopWords: List[String] = new ArrayList[String]
-    
-    val languageCode : String = detectLanguage(content)
-    val stopWords:Set[String] = STOP_WORDS(languageCode)
-
-    val stopWordsMatcher = languageCode match {
-      case "ko" => overlappingStopWordsMatherForKorean(_, _)
-      case other => overlappingStopWordsMatcherForNormal(_, _)
-    }
+//    val stopWords = getStopWords(language)
+    val stopWords = getStopWords(lang)
+if (stopWords.size > 0) {
+    //scala-ify? overlappingStopWords = candidateWords.filter(w=>stopWords.contains(w.toLowerCase)).map(w=>w.toLowerCase)
     candidateWords.foreach(w => {
-      if(stopWordsMatcher(stopWords, w)) overlappingStopWords.add(w.toLowerCase)
+       if (stopWords.contains(w.toLowerCase)) {
+         overlappingStopWords = w.toLowerCase :: overlappingStopWords
+       }
     })
+}
     ws.setWordCount(candidateWords.length)
     ws.setStopWordCount(overlappingStopWords.size)
     ws.setStopWords(overlappingStopWords)
     ws
   }
-
-  def overlappingStopWordsMatherForKorean(stopWords:Set[String], w:String):Boolean = stopWords.exists(w.endsWith(_))
-  def overlappingStopWordsMatcherForNormal(stopWords:Set[String],w:String):Boolean = stopWords.contains(w.toLowerCase)
   
-  /**
-   * This method returns the code of the language identified in the content
-   * passed as parameter.
-   */
-  def detectLanguage(content: String): String = {
-    val language = detector.detectLang(content)
-    STOP_WORDS.keys.find(language == _).getOrElse("en")
-  }
-
+  def  tokenize(line: String): List[String] = {
+    
+    var seg = new ComplexSeg(Dictionary.getInstance());
+    var mmSeg = new MMSeg(new StringReader(line), seg);
+    var tokens = List[String]();
+    var word = mmSeg.next()
+    while (word != null) {
+      tokens = word.getString() :: tokens ;
+      word = mmSeg.next();
+    }
+    return tokens;
+  }  
 }

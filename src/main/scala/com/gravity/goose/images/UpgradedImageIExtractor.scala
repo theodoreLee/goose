@@ -19,6 +19,8 @@ import io.Source
  * Date: 9/22/11
  */
 
+case class DepthTraversal(node: Element, parentDepth: Int, siblingDepth: Int)
+
 class UpgradedImageIExtractor(httpClient: HttpClient, article: Article, config: Configuration) extends ImageExtractor {
 
   import UpgradedImageIExtractor._
@@ -43,7 +45,7 @@ class UpgradedImageIExtractor(httpClient: HttpClient, article: Article, config: 
   val matchBadImageNames: Matcher = {
     val sb = new StringBuilder
     // create negative elements
-    sb.append(".html|.gif|.ico|button|twitter.jpg|facebook.jpg|ap_buy_photo|digg.jpg|digg.png|delicious.png|facebook.png|reddit.jpg|doubleclick|diggthis|diggThis|adserver|/ads/|ec.atdmt.com")
+  sb.append(".html|.gif|.ico|button|twitter.jpg|facebook.jpg|ap_buy_photo|digg.jpg|digg.png|delicious.png|facebook.png|reddit.jpg|doubleclick|diggthis|diggThis|adserver|/ads/|ec.atdmt.com")
     sb.append("|mediaplex.com|adsatt|view.atdmt")
     Pattern.compile(sb.toString()).matcher(string.empty)
   }
@@ -70,6 +72,18 @@ class UpgradedImageIExtractor(httpClient: HttpClient, article: Article, config: 
     }
 
     new Image
+  }
+
+  def getAllImages(node: Element): List[Image] = {
+    getImageCandidates(node) match {
+      case Some(goodImages) => {
+        val scoredImages = downloadImagesAndGetResults(goodImages, 0)
+        scoredImages.map((scoredImage: (LocallyStoredImage, Float)) => scoredImageToResultImage(scoredImage._1, scoredImages.size)).toList
+      }
+      case None => {
+        Nil
+      }
+    }
   }
 
   /**
@@ -117,13 +131,7 @@ class UpgradedImageIExtractor(httpClient: HttpClient, article: Article, config: 
         // get the high score image in a tuple
         scoredImages.sortBy(-_._2).take(1).headOption match {
           case Some(highScoreImage) => {
-            val mainImage = new Image
-            // mainImage.topImageNode = highScoreImage
-            mainImage.imageSrc = highScoreImage._1.imgSrc
-            mainImage.imageExtractionType = "bigimage"
-            mainImage.bytes = highScoreImage._1.bytes
-            mainImage.confidenceScore = if (scoredImages.size > 0) (100 / scoredImages.size) else 0
-            mainImage.imageScore = highScoreImage._2
+            val mainImage = scoredImageToResultImage(highScoreImage._1, scoredImages.size)
             trace("IMAGE COMPLETE: High Score Image is: " + mainImage.imageSrc + " Score is: " + highScoreImage._2)
             return Some(mainImage)
           }
@@ -150,6 +158,18 @@ class UpgradedImageIExtractor(httpClient: HttpClient, article: Article, config: 
     }
 
     None
+  }
+
+  private def scoredImageToResultImage(scoredImage: LocallyStoredImage, scoredImagesLength: Int): Image = {
+    val mainImage = new Image
+    // mainImage.topImageNode = highScoreImage
+    mainImage.imageSrc = scoredImage.imgSrc
+    mainImage.imageExtractionType = "bigimage"
+    mainImage.bytes = scoredImage.bytes
+    mainImage.width = scoredImage.width
+    mainImage.height = scoredImage.height
+    mainImage.confidenceScore = if (scoredImagesLength > 0) (100 / scoredImagesLength) else 0
+    mainImage
   }
 
   def getDepthLevel(node: Element, parentDepth: Int, siblingDepth: Int): Option[DepthTraversal] = {
@@ -195,8 +215,9 @@ class UpgradedImageIExtractor(httpClient: HttpClient, article: Article, config: 
         height = locallyStoredImage.height
         if (height > MIN_HEIGHT)
         fileExtension = locallyStoredImage.fileExtension
-        if (fileExtension != ".gif" && fileExtension != "NA")
-        imageSrc = locallyStoredImage.imgSrc
+        //why not gif?:  if (fileExtension != ".gif" && fileExtension != "NA")
+        if (fileExtension != "NA")
+        	imageSrc = locallyStoredImage.imgSrc
         if ((depthLevel >= 1 && locallyStoredImage.width > 300) || depthLevel < 1)
         if (!isBannerDimensions(width, height))
       } {
@@ -222,8 +243,33 @@ class UpgradedImageIExtractor(httpClient: HttpClient, article: Article, config: 
     imageResults
   }
 
-  def getAllImages: ArrayList[Element] = {
-    null
+  def getAllImages(topNode: Element, parentDepthLevel: Int = 0, siblingDepthLevel: Int = 0): List[Image] = {
+    trace("getting All Images")
+    var images: ListBuffer[Image] = new ListBuffer()
+    getImageCandidates(topNode) match {
+      case Some(candidateImages) => {
+        for {
+          cadidateImg <- candidateImages
+          locallyStoredImg <- getLocallyStoredImage(buildImagePath(cadidateImg.attr("src")))
+        } {
+          var img = new Image 
+          img.imageSrc = locallyStoredImg.imgSrc
+          img.width = locallyStoredImg.width
+          img.height = locallyStoredImg.height
+          img.bytes = locallyStoredImg.bytes
+          images += img
+  }
+        return images.toList
+      }
+      case None => {
+        getDepthLevel(topNode, parentDepthLevel, siblingDepthLevel) match {
+          case Some(depthObj) => {
+            return getAllImages(depthObj.node, depthObj.parentDepth, depthObj.siblingDepth)
+          }
+          case None => return images.toList
+        }
+      } 
+    }
   }
 
   /**
@@ -308,7 +354,8 @@ class UpgradedImageIExtractor(httpClient: HttpClient, article: Article, config: 
       filteredImages <- filterBadNames(images)
       goodImages <- findImagesThatPassByteSizeTest(filteredImages)
     } {
-      return Some(filteredImages)
+      //return Some(filteredImages)
+      return Some(goodImages)
     }
     None
 
